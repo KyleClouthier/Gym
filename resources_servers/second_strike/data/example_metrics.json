@@ -7,7 +7,7 @@
     "gitlab_identifier": null,
     "huggingface_identifier": null,
     "license": null,
-    "Number of examples": 18,
+    "Number of examples": 5,
     "Number of tools": {
         "Total # non-null values": 0,
         "Average": 0.0,
@@ -16,14 +16,14 @@
         "Standard deviation": 0.0
     },
     "Json-dumped number of words (proxy for token count)": {
-        "Total # non-null values": 18,
-        "Average": 175.67,
+        "Total # non-null values": 5,
+        "Average": 176.2,
         "Min": 166.0,
         "Max": 186.0,
-        "Standard deviation": 6.14
+        "Standard deviation": 7.16
     },
     "Number of turns": {
-        "Total # non-null values": 18,
+        "Total # non-null values": 5,
         "Average": 1.0,
         "Min": 1.0,
         "Max": 1.0,
@@ -37,14 +37,14 @@
         "Standard deviation": 0.0
     },
     "scenario": {
-        "unique_count": 6,
-        "total_count": 18
+        "unique_count": 5,
+        "total_count": 5
     },
     "seed": {
-        "Total # non-null values": 18,
-        "Average": 3561002.0,
+        "Total # non-null values": 5,
+        "Average": 3661001.0,
         "Min": 1061001.0,
-        "Max": 6061003.0,
-        "Standard deviation": 1757337.56
+        "Max": 6061001.0,
+        "Standard deviation": 2073644.14
     }
 }

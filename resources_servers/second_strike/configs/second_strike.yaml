@@ -6,7 +6,7 @@ second_strike:
       domain: games
       verified: false
       description: SECOND STRIKE. Model commands a nation in a lockstep world war against 42 AI nations, with a nuclear doomsday clock. Reward is the balanced Midnight Score from the game server's record of the war.
-      value: Multi-step strategy, diplomacy and nuclear restraint under pressure (the 18 Midnight Index wars)
+      value: Multi-step strategy, diplomacy and nuclear restraint under pressure (the Midnight Index wars)
       base_url: https://secondstrike-server-zgqvqzdrta-uc.a.run.app
       # The public server seats two wars per address at a time.
       max_concurrent_wars: 2
