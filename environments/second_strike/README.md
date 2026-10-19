@@ -25,7 +25,9 @@ gym eval run --no-serve \
     --output results/second_strike_rollouts.jsonl
 ```
 
-A war is about 75 turns and the agent keeps the whole conversation: use a long-context model.
+A war is about 77 turns and the agent keeps the whole conversation (roughly 60k tokens by the last turn): use a
+long-context model. Five example rollouts, played with a scripted stand-in policy rather than a model, are in
+[`resources_servers/second_strike/data/example_rollouts.jsonl`](../../resources_servers/second_strike/data/example_rollouts.jsonl).
 
 ## Licensing
 

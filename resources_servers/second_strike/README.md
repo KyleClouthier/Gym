@@ -29,7 +29,7 @@ repository. The resources server is an adapter: it opens one war per rollout and
   joins a new **lockstep** war of that scenario and seed, starts it, and waits until the clock holds for orders. The
   observation is the full rules, the scenario, and the first state as JSON. In lockstep the war's clock waits for the
   model's orders every turn, then runs 12 seconds of war time, so the same seed always gives the same states. A war
-  is about 75 turns.
+  is about 77 turns.
 - `step()` parses one JSON object from the model's reply, `{"thinking": "...", "say": "...", "orders": [...]}`
   (code fences and text around the object are tolerated, at most 8 orders are kept), sends the orders, waits for the
   next lockstep turn and returns the new state. Orders the rules refused lead the next observation. A reply that is
@@ -79,8 +79,21 @@ gym eval run --no-serve \
     --output results/second_strike_rollouts.jsonl
 ```
 
-A war is about 75 turns, and `gymnasium_agent` keeps the whole conversation, so the last turns carry roughly 80k
-tokens of context. Use a long-context model. `max_steps` is 100: a full war plus room for correction turns.
+A war is about 77 turns, and `gymnasium_agent` keeps the whole conversation, so the last turns carry about 240k
+characters (roughly 60k tokens) of context, and a whole war sends about 2.2M input tokens in total. Use a long-context
+model, ideally with prompt caching. `max_steps` is 100: a full war plus room for correction turns.
+
+## Example rollouts
+
+`data/example_rollouts.jsonl` holds five wars (`ffa`, `cornered`, `laststand`, `treaty` and `surrender`, seed 1 of
+each) played through the full Gym stack (`gym env start`, `gym eval run`, `gymnasium_agent` and the live game server)
+with a **scripted stand-in policy, not a model**. It spawns, then expands every turn, and answers its third turn in
+prose to show the correction message. Every war ran its 77 turns to the end, with all 12 components in the final
+`info`. All five scored about 0.50: they survived and kept every pact, but held under 2% of the land and never won. In
+the surrender war the terms were offered and refused by silence (`kept_terms` 0.5).
+`data/example_rollouts_aggregate_metrics.json` summarizes them.
+
+No rollout with a real model has been collected yet: the sandbox the adapter was built in had no working model key.
 
 The public server seats two wars per address at a time, so the adapter plays at most `max_concurrent_wars` (2) wars at
 once and other rollouts wait at `reset()`. It also runs a few lockstep wars at once overall: when it is busy, a join
