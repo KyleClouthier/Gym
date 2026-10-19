@@ -5,7 +5,7 @@ second_strike:
       entrypoint: app.py
       domain: games
       verified: false
-      description: SECOND STRIKE. Model commands a nation in a lockstep world war against 42 AI nations, with a nuclear doomsday clock. Reward is the balanced Midnight Score from the game server's record of the war.
+      description: SECOND STRIKE. Model commands a nation in a lockstep world war against 42 AI nations, with a nuclear doomsday clock. Reward is the reward_preset score (balanced Midnight Score by default) from the game server's record of the war.
       value: Multi-step strategy, diplomacy and nuclear restraint under pressure (the Midnight Index wars)
       base_url: https://secondstrike-server-zgqvqzdrta-uc.a.run.app
       # The public server seats two wars per address at a time.
@@ -14,6 +14,8 @@ second_strike:
       key_cache_path: ~/.cache/second-strike/nemo-gym-agents.json
       # The model's name, shown on the server's public record of each war.
       model_label: null
+      # The reward of the finished war: balanced (the Midnight Score), win, nonuke or honest.
+      reward_preset: balanced
 second_strike_gymnasium_agent:
   responses_api_agents:
     gymnasium_agent:

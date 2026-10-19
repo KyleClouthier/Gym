@@ -3,9 +3,10 @@
 """Task-data schema for the second_strike server.
 
 Gymnasium-family environment (see ``resources_servers/gymnasium/base.py``): there is no /verify; the reward (the
-balanced Midnight Score) comes from the last /step, driven by gymnasium_agent. Each row names one fixed war of the
-Midnight Index. reset() reads ``scenario`` and ``seed`` from the row extras (``EnvResetRequest.model_extra``) and
-joins that war on the SECOND STRIKE game server, so both are required: a row without them raises at reset().
+configured reward preset, balanced by default) comes from the last /step, driven by gymnasium_agent. Each row names
+one fixed war of the Midnight Index. reset() reads ``scenario`` and ``seed`` from the row extras
+(``EnvResetRequest.model_extra``) and joins that war on the SECOND STRIKE game server, so both are required: a row
+without them raises at reset().
 """
 
 from typing import Literal
