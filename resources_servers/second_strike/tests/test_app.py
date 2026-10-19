@@ -21,6 +21,7 @@ import stat
 from typing import Any, Callable, Optional
 from unittest.mock import MagicMock
 
+import anyio
 import httpx
 import pytest
 
@@ -110,6 +111,9 @@ class FakeGameServer:
         self.handlers: dict[tuple[str, str], Callable[[dict], tuple]] = {}
         self.registered = 0
         self.joined_keys: list[str] = []
+        # Routes that never answer, to hold a request open while the test cancels it.
+        self.hang_on: set[tuple[str, str]] = set()
+        self.hanging = asyncio.Event()
         self.on(("GET", "/api/agent/rules"), [(200, {"rules": "THE RULES OF SECOND STRIKE"})])
         self.handlers[("POST", "/api/agent/register")] = self._register
         self.handlers[("POST", "/api/agent/join")] = self._join
@@ -133,6 +137,8 @@ class FakeGameServer:
         return [c for c in self.calls if c["method"] == method and c["path"] == path]
 
     async def request(self, method: str, url: str, **kwargs) -> FakeResponse:
+        # A real request yields to the event loop before it reaches the server, so a cancelled one never arrives.
+        await asyncio.sleep(0)
         assert url.startswith(BASE), url
         path = url[len(BASE) :]
         auth = (kwargs.get("headers") or {}).get("Authorization", "")
@@ -144,6 +150,9 @@ class FakeGameServer:
         }
         self.calls.append(call)
         route = (method, path)
+        if route in self.hang_on:
+            self.hanging.set()
+            await asyncio.Event().wait()
         queue = self.answers.get(route)
         if queue:
             answer = queue.pop(0) if len(queue) > 1 else queue[0]
@@ -590,6 +599,43 @@ class TestStep:
         assert env._free_keys == ["ssa_new1"]
         assert len(server.calls_to("POST", "/api/agent/leave")) == 1
 
+    async def test_a_cancelled_step_still_leaves_the_war(self, server, clock, key_file):
+        # The server's disconnect middleware cancels the whole request scope (AnyIO level cancellation): every later
+        # await in it is cancelled again, so the cleanup must be shielded to reach the game server.
+        env = make_env(key_file, max_concurrent_wars=1)
+        await started(env, server)
+        server.hang_on.add(("POST", "/api/agent/orders"))
+
+        async def play():
+            await env.step(response(ORDERS_REPLY), {}, session_id="sid")
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(play)
+            await server.hanging.wait()
+            tg.cancel_scope.cancel()
+
+        assert len(server.calls_to("POST", "/api/agent/leave")) == 1
+        assert env.session_state == {}
+        assert env._slots.locked() is False
+        assert env._free_keys == ["ssa_new1"]
+
+    async def test_a_cancelled_reset_still_leaves_the_war(self, server, clock, key_file):
+        # The agent sends no /close after a failed /reset, so the server must leave on its own.
+        env = make_env(key_file, max_concurrent_wars=1)
+        server.hang_on.add(("POST", "/api/agent/start"))
+
+        async def start():
+            await env.reset({"scenario": "ffa", "seed": 1061001}, session_id="sid")
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(start)
+            await server.hanging.wait()
+            tg.cancel_scope.cancel()
+
+        assert len(server.calls_to("POST", "/api/agent/leave")) == 1
+        assert env.session_state == {}
+        assert env._slots.locked() is False
+
     async def test_a_turn_that_never_comes_back_times_out(self, server, clock, key_file):
         env = make_env(key_file, turn_timeout_seconds=10)
         await started(env, server)
@@ -607,11 +653,87 @@ class TestStep:
         assert len(server.calls_to("POST", "/api/agent/orders")) == 4
         assert clock.sleeps[-3:] == [1.5, 3.0, 4.5]
 
-    async def test_step_without_a_war_is_truncated(self, server, clock, key_file):
+    async def test_step_without_a_war_raises(self, server, clock, key_file):
+        # Lost state (a restarted server, a step sent again after its war ended) must not be scored as a 0.
         env = make_env(key_file)
-        obs, reward, terminated, truncated, info = await env.step(response(ORDERS_REPLY), {}, session_id="nobody")
-        assert (obs, reward, terminated, truncated) == (None, 0.0, False, True)
-        assert "reset" in info["error"]
+        with pytest.raises(SecondStrikeServerError, match="No war is open"):
+            await env.step(response(ORDERS_REPLY), {}, session_id="nobody")
+        assert server.calls == []
+
+    async def test_a_refused_orders_call_gets_a_correction_without_waiting(self, server, clock, key_file):
+        env = make_env(key_file)
+        await started(env, server)
+        server.on(("POST", "/api/agent/orders"), [(400, {"error": "Orders too large."})])
+        server.on(("GET", "/api/agent/state"), [(200, waiting(0))])
+        state_calls = len(server.calls_to("GET", "/api/agent/state"))
+        obs, reward, terminated, truncated, info = await env.step(response(ORDERS_REPLY), {}, session_id="sid")
+
+        assert obs.startswith("The server refused the whole orders call (Orders too large.)")
+        assert (reward, terminated, truncated, info) == (0.0, False, False, {"orders_refused": True})
+        assert len(server.calls_to("GET", "/api/agent/state")) == state_calls + 1  # one look, no wait for a turn
+        assert len(server.calls_to("POST", "/api/agent/orders")) == 1
+        war = env.session_state["sid"]
+        assert (war.turns, war.invalid_replies) == (0, 1)
+
+    async def test_a_refused_orders_call_on_a_lost_seat_raises(self, server, clock, key_file):
+        env = make_env(key_file)
+        await started(env, server)
+        server.on(("POST", "/api/agent/orders"), [(401, {"error": "Unknown token."})])
+        server.on(("GET", "/api/agent/state"), [(401, {"error": "Unknown token."})])
+        with pytest.raises(SecondStrikeServerError, match="Unknown token"):
+            await env.step(response(ORDERS_REPLY), {}, session_id="sid")
+        assert "sid" not in env.session_state
+
+    async def test_orders_are_not_sent_again_once_the_clock_moved(self, server, clock, key_file):
+        # The answer was lost, but the server played the orders: sending them again would play them next turn too.
+        env = make_env(key_file)
+        await started(env, server)
+        server.on(("POST", "/api/agent/orders"), [(502, b"<html>Bad gateway</html>"), (200, {"results": []})])
+        server.on(("GET", "/api/agent/state"), [(200, running(60)), (200, waiting(120))])
+        obs, _, terminated, _, _ = await env.step(response(ORDERS_REPLY), {}, session_id="sid")
+        assert len(server.calls_to("POST", "/api/agent/orders")) == 1
+        assert terminated is False
+        assert json.loads(obs) == waiting(120)
+
+    async def test_orders_are_sent_again_when_the_clock_did_not_move(self, server, clock, key_file):
+        env = make_env(key_file)
+        await started(env, server)
+        server.on(("POST", "/api/agent/orders"), [(502, b"<html>Bad gateway</html>"), (200, {"results": []})])
+        server.on(("GET", "/api/agent/state"), [(200, waiting(0)), (200, waiting(120))])
+        obs, _, _, _, _ = await env.step(response(ORDERS_REPLY), {}, session_id="sid")
+        assert len(server.calls_to("POST", "/api/agent/orders")) == 2
+        assert json.loads(obs) == waiting(120)
+
+    async def test_terms_on_the_final_record_do_not_change_the_score(self, server, clock, key_file):
+        # midnight_index/task.py tracks terms only on the turns the model saw, never on the final state.
+        env = make_env(key_file)
+        await started(env, server, scenario="surrender")
+        server.on(("GET", "/api/agent/state"), [(200, waiting(120, terms={"status": "You surrendered. Ceasefire."}))])
+        await env.step(response('{"orders": [{"do": "surrender"}]}'), {}, session_id="sid")
+        final = over(won_row(won=False, land=20.0)) | {"terms": {"status": "You broke the terms. War again."}}
+        server.on(("GET", "/api/agent/state"), [(200, final)])
+        _, _, _, _, info = await env.step(response('{"orders": []}'), {}, session_id="sid")
+        assert info["terms"] == {"offered": True, "surrendered": True, "broke": False}
+        assert info["kept_terms"] == 1.0
+
+    async def test_the_key_cache_is_deduplicated_and_kept_private(self, server, clock, key_file):
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text(json.dumps(["ssa_a", "ssa_a"]))
+        os.chmod(key_file, 0o644)
+        env = make_env(key_file)
+        await started(env, server, sid="one")
+        await started(env, server, sid="two")
+        # One key is one war at a time: the duplicate is not lent twice, so the second war registers its own.
+        assert server.joined_keys == ["ssa_a", "ssa_new1"]
+        assert json.loads(key_file.read_text()) == ["ssa_a", "ssa_new1"]
+        assert stat.S_IMODE(os.stat(key_file).st_mode) == 0o600
+        assert [p.name for p in key_file.parent.iterdir()] == [key_file.name]  # no temporary file left behind
+
+    async def test_a_war_repr_never_shows_the_key_or_token(self, server, clock, key_file):
+        env = make_env(key_file)
+        await started(env, server)
+        text = repr(env.session_state["sid"])
+        assert "ssa_new1" not in text and "tok-1" not in text
 
 
 # ---------------------------------------------------------------------- HTTP surface

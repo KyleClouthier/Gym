@@ -38,6 +38,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Optional
 
+import anyio
 from aiohttp import ClientError, ClientTimeout
 from fastapi import FastAPI, Request
 from pydantic import Field, PrivateAttr
@@ -97,6 +98,11 @@ CORRECTION = (
     'one JSON object: {"thinking": "...", "say": "...", "orders": [...]}'
 )
 
+ORDERS_REFUSED = (
+    "The server refused the whole orders call ({error}), so nothing was played and the war is still waiting for you. "
+    'Reply with exactly one JSON object: {{"thinking": "...", "say": "...", "orders": [...]}}'
+)
+
 MAX_ORDERS = 8
 # The server answers a state call at most twice a second per war.
 STATE_INTERVAL_SECONDS = 0.55
@@ -105,6 +111,8 @@ MAX_ATTEMPTS = 4
 # A join tries this many keys when the first ones are still seated in a war another process never left.
 MAX_KEYS_PER_JOIN = 3
 MAX_RETRY_AFTER_SECONDS = 120.0
+# Leaving runs during cleanup, possibly while the request is being cancelled: it is shielded, so it needs its own bound.
+LEAVE_TIMEOUT_SECONDS = 15.0
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
@@ -217,24 +225,33 @@ def _retry_delay(payload: dict, headers: Any, default: float) -> float:
 
 
 def _load_keys(path: Path) -> list[str]:
+    """The cached keys, each once, in the order they were saved."""
     try:
         with path.open(encoding="utf-8") as f:
-            return [k for k in json.load(f) if isinstance(k, str) and k]
+            return list(dict.fromkeys(k for k in json.load(f) if isinstance(k, str) and k))
     except (OSError, ValueError, TypeError):
         return []
 
 
 def _save_key(path: Path, key: str) -> None:
-    """Append a registered key to the cache file, readable by its owner only. A failure only costs a registration."""
+    """Add a registered key to the cache file, readable by its owner only. A failure only costs a registration.
+
+    The file is written to a private temporary file and swapped in, so a crash mid-write never loses the keys already
+    cached, and a file someone created by hand with wider permissions ends up readable by its owner only.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         keys = _load_keys(path)
         if key not in keys:
             keys.append(key)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(keys, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
     except OSError:
+        tmp.unlink(missing_ok=True)
         LOGGER.warning("Could not save the SECOND STRIKE agent key to %s; it is used for this process only.", path)
 
 
@@ -242,8 +259,8 @@ def _save_key(path: Path, key: str) -> None:
 class War:
     """One war a session is seated in."""
 
-    key: str
-    token: str
+    key: str = field(repr=False)
+    token: str = field(repr=False)
     name: str
     scenario: str
     seed: int
@@ -437,15 +454,19 @@ class SecondStrikeEnv(GymnasiumServer):
             for key in seated_elsewhere:
                 self._return_key(key, last=True)
 
+    async def _poll_state(self, war: War) -> dict:
+        """One state call, spaced after the last one for this war as the server asks (at most twice a second)."""
+        wait = war.last_state_at + STATE_INTERVAL_SECONDS - monotonic()
+        if wait > 0:
+            await sleep(wait)
+        war.last_state_at = monotonic()
+        return await self._call("GET", "/api/agent/state", token=war.token)
+
     async def _wait_turn(self, war: War) -> dict:
         """This turn's state: once the clock holds for our orders on a newer tick, the war is over, or the seat is lost."""
         deadline = monotonic() + self.config.turn_timeout_seconds
         while True:
-            wait = war.last_state_at + STATE_INTERVAL_SECONDS - monotonic()
-            if wait > 0:
-                await sleep(wait)
-            war.last_state_at = monotonic()
-            state = await self._call("GET", "/api/agent/state", token=war.token)
+            state = await self._poll_state(war)
             if _is_over(state) or _seat_lost(state):
                 return state
             lockstep = state.get("lockstep") or {}
@@ -460,23 +481,71 @@ class SecondStrikeEnv(GymnasiumServer):
                     f"{self.config.turn_timeout_seconds:.0f}s"
                 )
 
-    async def _leave(self, war: War) -> None:
+    async def _current_state(self, war: War) -> dict:
+        """The state as it is now, asking again while the server only answers that we asked too soon."""
+        state: dict = {}
+        for _ in range(MAX_ATTEMPTS):
+            state = await self._poll_state(war)
+            if not _is_pacing(state):
+                break
+        return state
+
+    async def _send_orders(self, war: War, body: dict) -> dict:
+        """POST this turn's orders. They are sent again only when the server cannot have played them already.
+
+        A 429 or 503 means the server did not take the call. After a lost answer (a transport error or another 5xx)
+        the orders may already have been played, and the clock moves on about a second later; sending them again
+        would play them on the next turn too. So the state is read first, and a clock that moved counts as delivered.
+        """
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                status, payload, headers = await self._send("POST", "/api/agent/orders", token=war.token, body=body)
+            except (ClientError, asyncio.TimeoutError) as e:
+                status, payload, headers = 0, {"error": f"{type(e).__name__}: {e}"}, None
+            if status != 0 and status not in RETRYABLE_STATUSES:
+                return payload
+            if status not in (429, 503):
+                state = await self._current_state(war)
+                lockstep = state.get("lockstep") or {}
+                tick = lockstep.get("tick")
+                moved = not lockstep.get("waiting") or (isinstance(tick, int) and tick > war.last_tick)
+                if _is_over(state) or _seat_lost(state) or moved:
+                    return {}
+            if attempt == MAX_ATTEMPTS:
+                raise SecondStrikeServerError(
+                    f"POST /api/agent/orders failed after {MAX_ATTEMPTS} attempts (HTTP {status}): "
+                    f"{payload.get('error', payload)}"
+                )
+            await sleep(_retry_delay(payload, headers, default=1.5 * attempt))
+        raise AssertionError("unreachable")
+
+    async def _leave(self, war: War) -> bool:
+        """Leave the war on the game server. True when the server confirmed it.
+
+        Shielded and bounded: the server's disconnect middleware cancels a request's whole scope, and every await in a
+        cancelled scope is cancelled again, so an unshielded leave from cleanup would never reach the game server.
+        """
         try:
-            await self._call("POST", "/api/agent/leave", token=war.token, body={}, attempts=2)
+            with anyio.CancelScope(shield=True), anyio.move_on_after(LEAVE_TIMEOUT_SECONDS):
+                answer = await self._call("POST", "/api/agent/leave", token=war.token, body={}, attempts=2)
+                return not answer.get("error")
         except Exception:
             # Cleanup boundary: a seat the server keeps is freed when that war ends, and a later join with this key
             # falls back to another one.
             LOGGER.warning("Could not leave the %s war (seed %s) cleanly", war.scenario, war.seed, exc_info=True)
+        return False
 
     async def _release(self, session_id: Optional[str]) -> bool:
         """Leave the session's war and free its key and slot, exactly once. False when it holds no war."""
         war = self.session_state.pop(session_id, None)
         if not isinstance(war, War):
             return False
+        left = False
         try:
-            await self._leave(war)
+            left = await self._leave(war)
         finally:
-            self._return_key(war.key)
+            # A key that may still be seated goes to the back of the line, so the next war tries a free one first.
+            self._return_key(war.key, last=not left)
             self._slots.release()
         return True
 
@@ -521,7 +590,8 @@ class SecondStrikeEnv(GymnasiumServer):
     ) -> tuple[Optional[str], float, bool, bool, dict]:
         war = self.session_state.get(session_id)
         if not isinstance(war, War):
-            return None, 0.0, False, True, {"error": "No war is open for this session: call reset first."}
+            # Lost state (a restarted server, a step sent again after its war ended) is not the model's doing.
+            raise SecondStrikeServerError("No war is open for this session: reset() was not called or its war ended.")
 
         reply = parse_reply(extract_text(action))
         if reply is None:
@@ -532,13 +602,16 @@ class SecondStrikeEnv(GymnasiumServer):
         if reply.get("say"):
             body["say"] = str(reply["say"])[:240]
         try:
-            res = await self._call("POST", "/api/agent/orders", token=war.token, body=body)
-            war.turns += 1
-            state = await self._wait_turn(war)
+            res = await self._send_orders(war, body)
+            if res.get("error"):
+                # The server refused the call as a whole, so the clock did not move: nothing to wait for.
+                state = await self._current_state(war)
+            else:
+                war.turns += 1
+                state = await self._wait_turn(war)
         except BaseException:
             await self._release(session_id)
             raise
-        track_terms(war.terms, state)
 
         if _is_over(state):
             reward, info = self._score(war, state)
@@ -546,7 +619,13 @@ class SecondStrikeEnv(GymnasiumServer):
         reason = _seat_lost(state)
         if reason:
             raise await self._drop(session_id, war, reason)
+        # As midnight_index/task.py does, terms count from the turns the model saw, not from the final record.
+        track_terms(war.terms, state)
 
+        if res.get("error"):
+            war.invalid_replies += 1
+            observation = ORDERS_REFUSED.format(error=str(res["error"])[:300])
+            return observation, 0.0, False, False, {"orders_refused": True}
         feedback = _refused_feedback(res)
         observation = (feedback + "\n" if feedback else "") + json.dumps(state, separators=(",", ":"))
         return observation, 0.0, False, False, {}

@@ -40,7 +40,9 @@ Every call to the game server retries politely while the server answers busy (42
 it sends. State calls are paced to at most two a second, as the server asks. A failure on the game server's side (a
 join that never succeeds, a seat the server dropped) raises an error, so the rollout fails instead of being scored as
 a loss: it is never the model's fault. The adapter advertises `/close`, so `gymnasium_agent` leaves the war when a
-rollout errors or runs out of steps.
+rollout errors or runs out of steps, and it also leaves on its own when a request is cancelled mid-turn. Orders whose
+answer was lost are never sent again once the war's clock has moved, so no turn plays them twice. A call the server
+refuses as a whole gets a correction message, like a reply that is not JSON.
 
 ## Reward
 
