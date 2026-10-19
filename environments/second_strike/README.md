@@ -16,6 +16,8 @@ reward components, configuration and licensing.
 gym env start --environment second_strike --model-type openai_model
 ```
 
+For a provider that serves Chat Completions only, such as DeepSeek, use `--model-type inference_provider`.
+
 ## Collect rollouts
 
 ```bash
@@ -25,9 +27,16 @@ gym eval run --no-serve \
     --output results/second_strike_rollouts.jsonl
 ```
 
-A war is about 77 turns and the agent keeps the whole conversation (roughly 60k tokens by the last turn): use a
-long-context model. Five example rollouts, played with a scripted stand-in policy rather than a model, are in
+A war is about 77 turns and the agent keeps the whole conversation, which grows with the nation: roughly 60k tokens
+by the last turn for a small nation, and over 100k for a large one. Use a long-context model. Five example rollouts,
+played with a scripted stand-in policy rather than a model, are in
 [`resources_servers/second_strike/data/example_rollouts.jsonl`](../../resources_servers/second_strike/data/example_rollouts.jsonl).
+
+One war played by a real model, DeepSeek's `deepseek-chat`, is in
+[`resources_servers/second_strike/data/example_rollouts_deepseek.jsonl`](../../resources_servers/second_strike/data/example_rollouts_deepseek.jsonl):
+the `laststand` war, seed 4061001. It ran 77 turns to a terminated step with all 12 reward components in `info`, and
+scored 0.783 (the scripted policy scored 0.504 on the same war). DeepSeek won with 38% of the land and did not strike
+midnight. See the server README for the details.
 
 ## Licensing
 

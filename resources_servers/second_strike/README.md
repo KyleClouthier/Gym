@@ -72,6 +72,8 @@ gym env start \
     --model-type openai_model
 ```
 
+For a provider that serves Chat Completions only, such as DeepSeek, use `--model-type inference_provider`.
+
 ## Collect rollouts
 
 ```bash
@@ -81,9 +83,11 @@ gym eval run --no-serve \
     --output results/second_strike_rollouts.jsonl
 ```
 
-A war is about 77 turns, and `gymnasium_agent` keeps the whole conversation, so the last turns carry about 240k
-characters (roughly 60k tokens) of context, and a whole war sends about 2.2M input tokens in total. Use a long-context
-model, ideally with prompt caching. `max_steps` is 100: a full war plus room for correction turns.
+A war is about 77 turns, and `gymnasium_agent` keeps the whole conversation. The state grows with the nation: with the
+scripted policy, whose nation stays small, the last turns carry about 240k characters (roughly 60k tokens) of context
+and a whole war sends about 2.2M input tokens. The DeepSeek war below, whose nation grew to 38% of the land, ended with
+about 450k characters of context and sent 6.3M input tokens, 6.1M of them cached. Use a long-context model, ideally
+with prompt caching. `max_steps` is 100: a full war plus room for correction turns.
 
 ## Example rollouts
 
@@ -95,7 +99,26 @@ prose to show the correction message. Every war ran its 77 turns to the end, wit
 the surrender war the terms were offered and refused by silence (`kept_terms` 0.5).
 `data/example_rollouts_aggregate_metrics.json` summarizes them.
 
-No rollout with a real model has been collected yet: the sandbox the adapter was built in had no working model key.
+`data/example_rollouts_deepseek.jsonl` holds one war played by a **real model**, DeepSeek's `deepseek-chat`, through
+the full Gym stack and the live game server. It is the `laststand` war, seed 4061001, the same war as the scripted
+`laststand` rollout. DeepSeek serves Chat Completions only, so it ran on `inference_provider` (on 2026-10-19 the API
+answered `deepseek-chat` as `deepseek-flash`):
+
+```bash
+gym env start --resources-server second_strike --model-type inference_provider \
+    --model deepseek-chat --model-url https://api.deepseek.com/v1 --model-api-key "$DEEPSEEK_API_KEY" \
+    "+second_strike.resources_servers.second_strike.model_label=deepseek-chat"
+gym eval run --no-serve --agent second_strike_gymnasium_agent \
+    --input laststand_4061001.jsonl --output results/second_strike_deepseek.jsonl --limit 1
+```
+
+Here `laststand_4061001.jsonl` holds that one row of `data/example.jsonl`. The war ran its 77 turns to a terminated
+step, not a truncated one, with all 12 components in the final `info`, and every reply was valid JSON. The reward was
+0.783, against 0.504 for the scripted policy on the same war. DeepSeek won: it placed first of 43 with 38% of the land,
+survived and kept every pact. It did not strike midnight. Saudi Arabia did, at 5:33 of war time, and was wiped out.
+The server's record credits DeepSeek's nation with one nuke, a launch at Indonesia at 2:39, although none of its 77
+replies holds a nuke order, so `land_if_no_nukes` and `won_if_no_nukes` are 0. The war took 3 minutes 17 seconds,
+and the adapter left it when it ended.
 
 The public server seats two wars per address at a time, so the adapter plays at most `max_concurrent_wars` (2) wars at
 once and other rollouts wait at `reset()`. It also runs a few lockstep wars at once overall: when it is busy, a join
